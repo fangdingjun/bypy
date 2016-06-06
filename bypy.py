@@ -2734,6 +2734,11 @@ try to create a file at PCS by combining slices, having MD5s specified
 
 		rfile = remotefile
 
+		# work directory for aria2c
+		wdir = os.getcwd()
+		if os.path.isabs(localfile):
+			wdir = "/"
+
 		# in python 2, the urlencode will fail
 		# when the parameters is unicode and has non-ascii characters
 		# we manually encode it
@@ -2748,7 +2753,7 @@ try to create a file at PCS by combining slices, having MD5s specified
 
 		full_url = "{}?{}".format(url, ulp.urlencode(pars))
 
-		cmd = "aria2c -c --user-agent='{}' -k10M -x10 -s10 -o '{}' '{}'".format(UserAgent, localfile, full_url)
+		cmd = "aria2c -c --user-agent='{}' -k10M -x10 -s10 -d '{}' -o '{}' '{}'".format(UserAgent, wdir, localfile, full_url)
 		self.pd("call: {}".format(cmd))
 		ret = call(cmd, shell=True)
 		self.pd("aria2c exit with status: {}".format(ret))
