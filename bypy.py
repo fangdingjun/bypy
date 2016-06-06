@@ -44,7 +44,7 @@ from __future__ import print_function
 from __future__ import division
 
 ### special variables that say about this module
-__version__ = '1.2.17'
+__version__ = '1.2.18'
 
 ### return (error) codes
 # they are put at the top because:
@@ -75,6 +75,7 @@ EUserRejected = 190 # user's decision
 EFatal = -1 # No way to continue
 # internal errors
 IEMD5NotFound = 31079 # File md5 not found, you should use upload API to upload the whole file.
+IESuperfileCreationFailed = 31081 # superfile create failed
 
 def bannerwarn(msg):
 	print('!' * 160)
@@ -313,6 +314,14 @@ HashCacheFileName = 'bypy.hashcache.json'
 HashCachePath = ConfigDir + os.sep + HashCacheFileName
 PickleFileName = 'bypy.pickle'
 PicklePath = ConfigDir + os.sep + PickleFileName
+# ProgressPath saves the MD5s of uploaded slices, for upload resuming
+# format:
+# {
+# 	abspath: [slice_size, [slice1md5, slice2md5, ...]],
+# }
+#
+ProgressFileName = 'bypy.parts.json'
+ProgressPath = ConfigDir + os.sep + ProgressFileName
 ByPyCertsFileName = 'bypy.cacerts.pem'
 ByPyCertsPath = ConfigDir + os.sep + ByPyCertsFileName
 # Old setting locations, should be moved to ~/.bypy to be clean
@@ -440,12 +449,13 @@ def pprgrc(finish, total, start_time = None, existing = 0,
 	if total > 0:
 		segth = seg * finish // total
 		percent = 100 * finish // total
+		current_batch_percent = 100 * (finish - existing) // total
 	else:
 		segth = seg
 		percent = 100
 	eta = ''
 	now = time.time()
-	if start_time is not None and percent > 5 and finish > 0:
+	if start_time is not None and current_batch_percent > 5 and finish > 0:
 		finishf = float(finish) - float(existing)
 		totalf = float(total)
 		remainf = totalf - float(finish)
@@ -763,7 +773,7 @@ def joinpath(first, second, sep = os.sep):
 # http://houtianze.github.io/python/unicode/json/2016/01/03/another-python-unicode-fisaco-on-json.html
 def py2_jsondump(data, filename):
 	with io.open(filename, 'w', encoding = 'utf-8') as f:
-		f.write(json.dumps(data, f, ensure_ascii = False, sort_keys = True, indent = 2))
+		f.write(unicode(json.dumps(data, ensure_ascii = False, sort_keys = True, indent = 2)))
 
 def py3_jsondump(data, filename):
 	with io.open(filename, 'w', encoding = 'utf-8') as f:
@@ -1686,7 +1696,7 @@ class ByPy(object):
 					self.pd("MD5 not found, rapidupload failed")
 					result = ec
 				# superfile create failed
-				elif ec == 31081: # and sc == 404:
+				elif ec == IESuperfileCreationFailed: # and sc == 404:
 					self.pd("Failed to combine files from MD5 slices (superfile create failed)")
 					result = ec
 				# errors that make retrying meaningless
@@ -2334,6 +2344,16 @@ get information of the given path (dir / file) at Baidu Yun.
 				#files = { 'file' : (os.path.basename(self.__current_file), self.__current_slice) } )
 				files = { 'file' : ('file', self.__current_slice) } )
 
+	def __update_progress_entry(self, fullpath):
+		progress = jsonload(ProgressPath)
+		progress[fullpath]=(self.__slice_size, self.__slice_md5s)
+		jsondump(progress, ProgressPath)
+
+	def __delete_progress_entry(self, fullpath):
+		progress = jsonload(ProgressPath)
+		progress.remove(fullpath)
+		jsondump(progress, ProgressPath)
+
 	def __upload_file_slices(self, localpath, remotepath, ondup = 'overwrite'):
 		pieces = MaxSlicePieces
 		slice = self.__slice_size
@@ -2351,8 +2371,40 @@ get information of the given path (dir / file) at Baidu Yun.
 
 		i = 0
 		ec = ENoError
+
+		fullpath = os.path.abspath(self.__current_file)
+		progress = {}
+		initial_offset = 0
+		if not os.path.exists(ProgressPath):
+			jsondump(progress, ProgressPath)
+		progress = jsonload(ProgressPath)
+		if fullpath in progress:
+			self.pd("Find the progress entry resume uploading")
+			(slice, md5s) = progress[fullpath]
+			self.__slice_md5s = []
+			with io.open(self.__current_file, 'rb') as f:
+				self.pd("Verifying the md5s. Total count = {}".format(len(md5s)))
+				for md in md5s:
+					cslice = f.read(slice)
+					cm = hashlib.md5(cslice)
+					if (binascii.hexlify(cm.digest()) == md):
+						self.pd("{} verified".format(md))
+						# TODO: a more rigorous check would be also verifying
+						# slices exist at Baidu Yun as well (rapidupload test?)
+						# but that's a bit complex. for now, we don't check
+						# this but simply delete the progress entry if later
+						# we got error combining the slices.
+						self.__slice_md5s.append(md)
+					else:
+						break
+				self.pd("verified md5 count = {}".format(len(self.__slice_md5s)))
+			i = len(self.__slice_md5s)
+			initial_offset = i * slice
+			self.pd("Start from offset {}".format(initial_offset))
+
 		with io.open(self.__current_file, 'rb') as f:
 			start_time = time.time()
+			f.seek(initial_offset, os.SEEK_SET)
 			while i < pieces:
 				self.__current_slice = f.read(slice)
 				m = hashlib.md5()
@@ -2366,7 +2418,8 @@ get information of the given path (dir / file) at Baidu Yun.
 					ec = self.__upload_slice(remotepath)
 					if ec == ENoError:
 						self.pd("Slice MD5 match, continuing next slice")
-						pprgr(f.tell(), self.__current_file_size, start_time)
+						pprgr(f.tell(), self.__current_file_size, start_time, initial_offset)
+						self.__update_progress_entry(fullpath)
 						break
 					elif j < self.__retry:
 						j += 1
@@ -2386,7 +2439,13 @@ get information of the given path (dir / file) at Baidu Yun.
 		else:
 			#self.pd("Sleep 2 seconds before combining, just to be safer.")
 			#time.sleep(2)
-			return self.__combine_file(remotepath, ondup = 'overwrite')
+			ec = self.__combine_file(remotepath, ondup = 'overwrite')
+			if ec == ENoError or ec == IESuperfileCreationFailed:
+				# we delete the upload progress entry also when we can't combine
+				# the file, as it might be caused by  the slices uploaded
+				# has expired / become invalid
+				self.__delete_progress_entry(fullpath)
+			return ec
 
 	def __rapidupload_file_act(self, r, args):
 		if self.__verify:
